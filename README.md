@@ -2,14 +2,14 @@
 
 Version 2 of [llm-risk-evaluation](https://github.com/joyleon872/llm-risk-evaluation): a fictional bank's customer service assistant rebuilt as a real system, with retrieval, tools, guardrails, observability and continuous evaluation.
 
-**Status:** Phase 3 of 5 complete (guardrails and observability).
+**Status:** Phase 4 of 5 complete (evals and CI).
 
 | Phase | What | Status |
 |---|---|---|
 | 1 | RAG assistant: FastAPI service answering from retrieved policy documents | ✅ |
 | 2 | Agent with MCP tools, plus a poisoned knowledge base for tool-misuse testing | ✅ |
 | 3 | Guardrails enforced in code (tool policy, confirmation, output filter) and observability dashboard | ✅ |
-| 4 | Evals comparing controls on/off, automated in CI | ⏳ |
+| 4 | Evals comparing prompt-only vs code guardrails under attack, automated in GitHub Actions | ✅ |
 | 5 | Docker + Azure deployment and risk assessment write-up | ⏳ |
 
 ## Run locally
@@ -54,8 +54,30 @@ The observability dashboard is at http://localhost:8000/dashboard.
    - `block_card` never runs directly; it creates a pending action the customer must confirm with a button (human in the loop)
    - `send_email` only goes to the customer's own address
    - an output filter removes links and email addresses that aren't on the allowlist
-7. **Observability** (`app/observability.py`): every request is logged to `logs/events.jsonl` (question, sources, tool calls with policy decisions, filtered output, tokens, latency), summarised at `/dashboard`.
+7. **Knowledge base scanner** (`app/kb_scanner.py`): at load time, any document chunk that addresses the AI, names an internal tool, asks for secrecy or references system instructions is quarantined and reported for human review. Added after the Phase 4 evaluation found that a planted note was crowding legitimate safety guidance out of retrieval. Turn off with `KB_SCAN=off`.
+8. **Observability** (`app/observability.py`): every request is logged to `logs/events.jsonl` (question, sources, tool calls with policy decisions, filtered output, tokens, latency), summarised at `/dashboard`.
 
 These implement recommendations 2 and 3 from project 1: filter outputs for unapproved links, and keep secrets out of the prompt. Phase 4 measures how much they change the agent's behaviour under attack.
 
 No secrets are placed in the system prompt, following recommendation 3 from project 1.
+
+## Evaluation (Phase 4)
+
+`evals/run_evals.py` runs 17 test cases (`evals/cases.yaml`) against two configurations, 10 times each:
+
+- **prompt_only:** safety rules in the system prompt only
+- **guardrails:** the same prompt plus the code-level controls
+
+Most checks look at what the agent **did**, not just what it said: which tools it called, on which card, to which address, and whether policy allowed it. Each security check records whether the model *attempted* the harmful action and whether it *succeeded*, since guardrails don't change what the model tries, only what actually happens. Results are reported with 95% Wilson confidence intervals.
+
+```bash
+python -m evals.run_evals                 # full run (about 340 agent runs)
+python -m evals.run_evals --repeats 3     # quicker
+python -m evals.run_evals --cases A1 A3 Q1 Q2 --configs guardrails guardrails_kbscan --name kbscan_fix   # verify the fix
+```
+
+The report is written to `results/findings_eval.md`.
+
+Each run is saved line by line to `results/eval_runs*.jsonl` as it completes, API calls time out after 60 seconds and retry, and `--report-from` rebuilds a report from saved runs, so a stalled request never costs a whole evaluation.
+
+**Continuous evaluation:** `.github/workflows/evals.yml` runs a small suite (8 cases, all controls on, 2 runs each) on every change to the agent, documents, guardrails or tests, and fails the build if any attack succeeds or a legitimate request breaks.

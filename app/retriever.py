@@ -16,6 +16,8 @@ from pathlib import Path
 
 from rank_bm25 import BM25Okapi
 
+from app.kb_scanner import scan
+
 WORD = re.compile(r"[a-z0-9æøå%]+")
 STOPWORDS = set("""a an the is are was be been to of in on at for by with from and or but if it its this that
 i my me you your we our can do does how what when where which who why will would could should
@@ -37,9 +39,20 @@ class Chunk:
 
 
 class Retriever:
-    def __init__(self, kb_dir: str):
+    def __init__(self, kb_dir: str, scan_kb: bool = True):
         self.kb_dir = Path(kb_dir)
+        self.scan_kb = scan_kb
+        self.quarantined: list[dict] = []  # chunks rejected by the scanner, for human review
         self.chunks = self._load_chunks()
+        if scan_kb:
+            clean = []
+            for c in self.chunks:
+                reasons = scan(c.text)
+                if reasons:
+                    self.quarantined.append({"source": c.source, "text": c.text, "reasons": reasons})
+                else:
+                    clean.append(c)
+            self.chunks = clean
         if not self.chunks:
             raise ValueError(f"No documents found in {self.kb_dir}")
         # Section name is included in the indexed text so "fees" matches fee lines

@@ -7,11 +7,12 @@ output filter removed, token usage and latency. The /dashboard page summarises
 the log so you can see at a glance what the controls caught.
 """
 import json
+import os
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-LOG_PATH = Path("logs/events.jsonl")
+LOG_PATH = Path(os.getenv("EVENT_LOG", "logs/events.jsonl"))
 
 
 def log_event(event: dict) -> None:

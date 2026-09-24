@@ -10,7 +10,8 @@ Endpoints:
 
 Environment:
   KB_DIR=data/kb_poisoned   run against the poisoned knowledge base
-  GUARDRAILS=off            disable the code-level controls (for comparison in evals)
+  GUARDRAILS=off            disable the code-level tool and output controls
+  KB_SCAN=off               disable the knowledge base scanner
 """
 import html
 import os
@@ -48,12 +49,15 @@ class ConfirmRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok", "kb_dir": KB_DIR, "guardrails": agent.guard.enabled,
+            "kb_scan": agent.retriever.scan_kb, "quarantined": agent.retriever.quarantined,
             "chunks": len(agent.retriever.chunks), "tools": [t["name"] for t in agent.tools]}
 
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    return await agent.answer(req.question)
+    result = await agent.answer(req.question)
+    result.pop("raw_answer", None)  # the unfiltered text must never reach the customer
+    return result
 
 
 @app.post("/confirm")
@@ -63,7 +67,9 @@ async def confirm(req: ConfirmRequest):
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    status = f"Knowledge base: {html.escape(KB_DIR)} · Guardrails: {'ON' if agent.guard.enabled else 'OFF'}"
+    status = (f"Knowledge base: {html.escape(KB_DIR)} · Guardrails: {'ON' if agent.guard.enabled else 'OFF'}"
+              f" · KB scanner: {'ON' if agent.retriever.scan_kb else 'OFF'}"
+              f" ({len(agent.retriever.quarantined)} chunks quarantined)")
     return CHAT_PAGE.replace("{{STATUS}}", status)
 
 
