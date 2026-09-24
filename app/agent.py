@@ -10,11 +10,14 @@ For each question the agent:
 Every tool call is recorded and returned with the answer, so tests can check
 not just what the agent SAID, but what it DID.
 
-Phase 2 note: the only protection against tool misuse here is the system
-prompt. Phase 3 adds controls enforced in code, and the evals compare the two.
+Every tool call passes through the guardrails (guardrails.py) before it runs,
+and every answer passes through the output filter before it is returned.
+Each request is logged for observability (observability.py).
 """
 import os
 import sys
+import time
+import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -22,6 +25,8 @@ import anthropic
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from app.guardrails import Guardrails
+from app.observability import log_event
 from app.retriever import Retriever
 
 MODEL = os.getenv("MODEL", "claude-haiku-4-5-20251001")
@@ -55,6 +60,7 @@ class Agent:
         self._stack = AsyncExitStack()
         self.session: ClientSession | None = None
         self.tools: list[dict] = []
+        self.guard = Guardrails(CUSTOMER)
 
     async def start(self):
         """Launch the MCP server as a subprocess and connect to it."""
@@ -79,6 +85,10 @@ class Agent:
         return "".join(getattr(c, "text", "") for c in result.content)
 
     async def answer(self, question: str) -> dict:
+        started = time.perf_counter()
+        request_id = uuid.uuid4().hex[:12]
+        usage = {"input_tokens": 0, "output_tokens": 0}
+        pending_actions = []
         chunks = self.retriever.search(question, k=TOP_K)
         context = "\n".join(c.as_context() for c in chunks) or "(no relevant documents found)"
         messages = [{
@@ -92,21 +102,55 @@ class Agent:
                 model=MODEL, max_tokens=800, system=SYSTEM_PROMPT,
                 tools=self.tools, messages=messages,
             )
+            u = getattr(response, "usage", None)
+            if u:
+                usage["input_tokens"] += getattr(u, "input_tokens", 0) or 0
+                usage["output_tokens"] += getattr(u, "output_tokens", 0) or 0
             if response.stop_reason != "tool_use":
                 break
             messages.append({"role": "assistant", "content": response.content})
             results = []
             for block in response.content:
-                if block.type == "tool_use":
-                    output = await self._call_tool(block.name, block.input)
-                    tool_calls.append({"tool": block.name, "input": block.input, "result": output})
-                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+                if block.type != "tool_use":
+                    continue
+                decision = self.guard.check_tool(block.name, block.input)
+                if decision.allowed:
+                    output, status = await self._call_tool(block.name, block.input), "allowed"
+                else:
+                    output = decision.message
+                    status = "pending_confirmation" if decision.pending_id else "blocked"
+                    if decision.pending_id:
+                        pending_actions.append({"id": decision.pending_id, "tool": block.name, "input": block.input})
+                tool_calls.append({"tool": block.name, "input": block.input, "result": output, "decision": status})
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output,
+                                "is_error": status == "blocked"})
             messages.append({"role": "user", "content": results})
 
-        text = "".join(b.text for b in response.content if b.type == "text")
-        return {
+        raw_text = "".join(b.text for b in response.content if b.type == "text")
+        text, removed = self.guard.filter_output(raw_text)
+        result = {
             "answer": text,
             "tool_calls": tool_calls,
+            "pending_actions": pending_actions,
+            "output_removed": removed,
+            "guardrails": self.guard.enabled,
             "sources": [{"source": c.source, "section": c.section, "text": c.text} for c in chunks],
             "model": MODEL,
         }
+        log_event({
+            "request_id": request_id, "question": question, "kb_dir": str(self.retriever.kb_dir),
+            "guardrails": self.guard.enabled, "sources": [c.source for c in chunks],
+            "tool_calls": tool_calls, "output_removed": removed, "raw_answer": raw_text,
+            "usage": usage, "latency_ms": round((time.perf_counter() - started) * 1000),
+        })
+        return result
+
+    async def confirm(self, action_id: str) -> dict:
+        """Run an action the customer has explicitly confirmed (human in the loop)."""
+        action = self.guard.take_pending(action_id)
+        if not action:
+            return {"ok": False, "message": "No pending action with that id (it may already have been used)."}
+        output = await self._call_tool(action["tool"], action["input"])
+        log_event({"request_id": action_id, "event": "confirmed_action", "tool_calls": [
+            {"tool": action["tool"], "input": action["input"], "result": output, "decision": "confirmed"}]})
+        return {"ok": True, "message": output}
