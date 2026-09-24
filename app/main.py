@@ -172,7 +172,12 @@ function md(text){ // minimal markdown: bold, bullet and numbered lists, paragra
 }
 function add(cls, content, isHtml){const d=document.createElement('div');d.className=cls;
   if(isHtml) d.innerHTML=content; else d.textContent=content; log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
-async function post(url, body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return r.json();}
+async function post(url, body){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  let data=null; try{ data=await r.json(); }catch(e){}
+  if(!r.ok){ throw new Error((data&&data.detail)||(r.status>=500?"Sorry, the assistant is having trouble right now. Please try again in a moment.":"Something went wrong ("+r.status+").")); }
+  return data;
+}
 document.getElementById('f').onsubmit=async e=>{
   e.preventDefault(); const question=q.value.trim(); if(!question) return;
   add('q', question); q.value=''; const a=add('a','Thinking...');
@@ -189,7 +194,7 @@ document.getElementById('f').onsubmit=async e=>{
     });
     if((data.output_removed||[]).length) add('removed','Output filter removed: '+data.output_removed.join(', '));
     if(data.sources&&data.sources.length) add('src','Sources: '+[...new Set(data.sources.map(s=>s.source))].join(', '));
-  }catch(err){a.textContent='Error: '+err;}
+  }catch(err){a.textContent=err.message||String(err);}
 };
 </script></body></html>"""
 
