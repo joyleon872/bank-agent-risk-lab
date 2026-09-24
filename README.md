@@ -41,6 +41,17 @@ GUARDRAILS=off KB_DIR=data/kb_poisoned uvicorn app.main:app --reload
 
 The observability dashboard is at http://localhost:8000/dashboard.
 
+## Run with Docker
+
+```bash
+docker build -t bank-agent .
+docker run -p 8000:8000 -e ANTHROPIC_API_KEY bank-agent
+```
+
+The container runs the poisoned knowledge base with every control on, so the dashboard shows the scanner quarantining the planted instructions. On every change to the app, GitHub Actions builds the image and publishes it to `ghcr.io/joyleon872/bank-agent-risk-lab`.
+
+A public demo is protected against runaway API spend by a per-visitor hourly limit and a daily cap (`RATE_LIMIT_PER_HOUR`, `DAILY_REQUEST_CAP`).
+
 ## How it works
 
 1. **Knowledge base:** policy documents in `data/kb/`, one file per area.

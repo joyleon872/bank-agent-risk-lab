@@ -12,12 +12,17 @@ Environment:
   KB_DIR=data/kb_poisoned   run against the poisoned knowledge base
   GUARDRAILS=off            disable the code-level tool and output controls
   KB_SCAN=off               disable the knowledge base scanner
+  RATE_LIMIT_PER_HOUR=30    max questions per visitor per hour (protects API spend on a public demo)
+  DAILY_REQUEST_CAP=300     max questions per day across all visitors
 """
 import html
 import os
+import time
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from datetime import date
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -38,6 +43,30 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Nordvik Bank Assistant", version="0.3.0", lifespan=lifespan)
 
 
+# ---------- Spend protection for a public demo ----------
+RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "30"))
+DAILY_REQUEST_CAP = int(os.getenv("DAILY_REQUEST_CAP", "300"))
+_hits: dict[str, deque] = defaultdict(deque)
+_day = {"date": None, "count": 0}
+
+
+def check_limits(request: Request) -> None:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    ip = forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    now, today = time.time(), date.today()
+    if _day["date"] != today:
+        _day.update(date=today, count=0)
+    if _day["count"] >= DAILY_REQUEST_CAP:
+        raise HTTPException(429, "The demo has reached its daily limit. Please try again tomorrow.")
+    hits = _hits[ip]
+    while hits and now - hits[0] > 3600:
+        hits.popleft()
+    if len(hits) >= RATE_LIMIT_PER_HOUR:
+        raise HTTPException(429, "Too many questions from your connection. Please try again in an hour.")
+    hits.append(now)
+    _day["count"] += 1
+
+
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
 
@@ -54,7 +83,8 @@ def health():
 
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
+    check_limits(request)
     result = await agent.answer(req.question)
     result.pop("raw_answer", None)  # the unfiltered text must never reach the customer
     return result
@@ -93,7 +123,12 @@ def dashboard():
                     f'<td>{esc(e.get("question", e.get("event", "")))}</td><td>{"<br>".join(issues)}</td></tr>')
     table = "".join(rows) or '<tr><td colspan="3">Nothing flagged yet.</td></tr>'
     by_tool = ", ".join(f"{k}: {v}" for k, v in s["tool_calls_by_tool"].items()) or "none"
-    return DASHBOARD_PAGE.replace("{{CARDS}}", card_html).replace("{{ROWS}}", table).replace("{{BYTOOL}}", esc(by_tool))
+    q = agent.retriever.quarantined
+    quarantine = "".join(f'<tr><td>{esc(c["source"])}</td><td>{esc(c["text"])}</td><td>{esc(", ".join(c["reasons"]))}</td></tr>'
+                         for c in q) or '<tr><td colspan="3">No chunks quarantined.</td></tr>'
+    return (DASHBOARD_PAGE.replace("{{CARDS}}", card_html).replace("{{ROWS}}", table)
+            .replace("{{BYTOOL}}", esc(by_tool)).replace("{{QUARANTINE}}", quarantine)
+            .replace("{{KB}}", esc(KB_DIR)).replace("{{QCOUNT}}", str(len(q))))
 
 
 STYLE = """
@@ -117,7 +152,8 @@ CHAT_PAGE = """<!doctype html>
   button.send{padding:10px 16px;border:0;border-radius:8px;background:#1f3a5f;color:#fff;font-size:15px;cursor:pointer}
 </style></head><body>
 <h1>Nordvik Bank Assistant</h1>
-<p class="sub">Fictional bank for AI risk testing. Logged in as Mette Larsen (card ending 4471).<br>{{STATUS}} · <a href="/dashboard">Dashboard</a></p>
+<p class="sub">Fictional bank for AI risk testing. Logged in as Mette Larsen (card ending 4471).<br>{{STATUS}} · <a href="/dashboard">Dashboard</a> · <a href="https://github.com/joyleon872/bank-agent-risk-lab">GitHub</a><br>
+Demo only: don't enter real personal information. Questions are logged for the dashboard.</p>
 <div id="log"></div>
 <form id="f"><input id="q" placeholder="Ask about fees, cards, loans..." autocomplete="off"><button class="send">Send</button></form>
 <script>
@@ -141,7 +177,7 @@ document.getElementById('f').onsubmit=async e=>{
   e.preventDefault(); const question=q.value.trim(); if(!question) return;
   add('q', question); q.value=''; const a=add('a','Thinking...');
   try{
-    const data=await post('/chat',{question}); a.innerHTML=md(data.answer||JSON.stringify(data));
+    const data=await post('/chat',{question}); a.innerHTML=md(data.answer||data.detail||JSON.stringify(data));
     const icon={allowed:'🔧',blocked:'⛔',pending_confirmation:'⏸'};
     (data.tool_calls||[]).forEach(t=>add('tool '+(t.decision==='pending_confirmation'?'pending':t.decision),
       (icon[t.decision]||'🔧')+' '+t.tool+'('+JSON.stringify(t.input)+') → '+t.result));
@@ -169,6 +205,8 @@ DASHBOARD_PAGE = """<!doctype html>
 <p class="sub">From logs/events.jsonl · <a href="/">Back to chat</a></p>
 <div class="grid">{{CARDS}}</div>
 <p class="sub">Tool calls by tool: {{BYTOOL}}</p>
+<h2 style="font-size:17px">Knowledge base scanner: {{QCOUNT}} chunks quarantined ({{KB}})</h2>
+<table><tr><th>Source</th><th>Quarantined text</th><th>Why</th></tr>{{QUARANTINE}}</table>
 <h2 style="font-size:17px">Flagged events (most recent first)</h2>
 <table><tr><th>Time (UTC)</th><th>Question</th><th>What the controls caught</th></tr>{{ROWS}}</table>
 </body></html>"""
