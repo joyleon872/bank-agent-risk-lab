@@ -4,20 +4,31 @@ Web service for the Nordvik Bank assistant.
 Endpoints:
   GET  /        simple chat page for demos
   GET  /health  status check (used later by Docker and Azure)
-  POST /chat    {"question": "..."} -> {"answer": "...", "sources": [...]}
+  POST /chat    {"question": "..."} -> {"answer": "...", "tool_calls": [...], "sources": [...]}
+
+Set KB_DIR=data/kb_poisoned to run against the poisoned knowledge base.
 """
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from app.bot import Bot
+from app.agent import Agent
 
 KB_DIR = os.getenv("KB_DIR", "data/kb")
+agent = Agent(KB_DIR)
 
-app = FastAPI(title="Nordvik Bank Assistant", version="0.1.0")
-bot = Bot(KB_DIR)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await agent.start()   # launch and connect to the MCP tool server
+    yield
+    await agent.stop()
+
+
+app = FastAPI(title="Nordvik Bank Assistant", version="0.2.0", lifespan=lifespan)
 
 
 class ChatRequest(BaseModel):
@@ -26,12 +37,13 @@ class ChatRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "kb_dir": KB_DIR, "chunks": len(bot.retriever.chunks)}
+    return {"status": "ok", "kb_dir": KB_DIR, "chunks": len(agent.retriever.chunks),
+            "tools": [t["name"] for t in agent.tools]}
 
 
 @app.post("/chat")
-def chat(req: ChatRequest):
-    return bot.answer(req.question)
+async def chat(req: ChatRequest):
+    return await agent.answer(req.question)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -47,12 +59,12 @@ CHAT_PAGE = """<!doctype html>
   h1{font-size:22px;margin-bottom:4px} .sub{color:#666;margin-top:0;font-size:14px}
   #log{border:1px solid #ddd;border-radius:10px;padding:12px;min-height:300px;margin:16px 0;overflow-y:auto}
   .q{font-weight:600;margin-top:12px} .a{white-space:pre-wrap;margin:4px 0 4px}
-  .src{font-size:12px;color:#777} form{display:flex;gap:8px}
+  .src{font-size:12px;color:#777} .tool{font-size:12px;color:#8a4b00;background:#fff4e5;border-radius:6px;padding:4px 8px;margin:4px 0;font-family:ui-monospace,monospace} form{display:flex;gap:8px}
   input{flex:1;padding:10px;border:1px solid #ccc;border-radius:8px;font-size:15px}
   button{padding:10px 16px;border:0;border-radius:8px;background:#1f3a5f;color:#fff;font-size:15px;cursor:pointer}
 </style></head><body>
 <h1>Nordvik Bank Assistant</h1>
-<p class="sub">Fictional bank for AI risk testing. Answers come only from retrieved policy documents.</p>
+<p class="sub">Fictional bank for AI risk testing. Logged in as Mette Larsen (card ending 4471). Tool calls are shown in orange.</p>
 <div id="log"></div>
 <form id="f"><input id="q" placeholder="Ask about fees, cards, loans..." autocomplete="off"><button>Send</button></form>
 <script>
@@ -64,6 +76,7 @@ document.getElementById('f').onsubmit=async e=>{
   try{
     const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question})});
     const data=await r.json(); a.textContent=data.answer || JSON.stringify(data);
+    (data.tool_calls||[]).forEach(t=>add('tool','🔧 '+t.tool+'('+JSON.stringify(t.input)+') → '+t.result));
     if(data.sources&&data.sources.length) add('src','Sources: '+[...new Set(data.sources.map(s=>s.source))].join(', '));
   }catch(err){a.textContent='Error: '+err;}
 };
